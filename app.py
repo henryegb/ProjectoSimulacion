@@ -1,9 +1,10 @@
-# app.py
+# app.py (patched)
 # ============================================
 # Robot TCR GTQ/USD - Banguat + Pronóstico
 # Autor: Henry Guzmán (para curso Modelación y Simulación)
 # ============================================
 
+import os
 import io
 import re
 import sys
@@ -15,6 +16,9 @@ import datetime as dt
 from functools import lru_cache
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -70,6 +74,20 @@ SOAP_HEADERS = {
     "Content-Type": "text/xml; charset=utf-8"
 }
 
+def _requests_session():
+    s = requests.Session()
+    retry = Retry(
+        total=5, connect=5, read=5,
+        backoff_factor=0.5,
+        status_forcelist=[500, 502, 503, 504],
+        allowed_methods=["GET", "POST"]
+    )
+    s.mount("https://", HTTPAdapter(max_retries=retry))
+    s.mount("http://", HTTPAdapter(max_retries=retry))
+    return s
+
+SESSION = _requests_session()
+
 def _soap_envelope_fecha_inicial(fecha_ini_str: str) -> str:
     # fecha_ini_str formato dd/mm/aaaa
     return f"""<?xml version="1.0" encoding="utf-8"?>
@@ -83,11 +101,30 @@ def _soap_envelope_fecha_inicial(fecha_ini_str: str) -> str:
   </soap:Body>
 </soap:Envelope>""".strip()
 
+def _soap_envelope_rango(fini:str, ffin:str, variant:int=0) -> str:
+    # diferentes etiquetas que el WS ha usado históricamente
+    if variant == 0:
+        params = f"<fechainit>{fini}</fechainit><fechafin>{ffin}</fechafin>"
+    elif variant == 1:
+        params = f"<fecha_ini>{fini}</fecha_ini><fecha_fin>{ffin}</fecha_fin>"
+    else:
+        params = f"<fechaini>{fini}</fechaini><fechafin>{ffin}</fechafin>"
+    return f"""<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+               xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+               xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    <TipoCambioRango xmlns="http://www.banguat.gob.gt/variables/ws/">
+      {params}
+    </TipoCambioRango>
+  </soap:Body>
+</soap:Envelope>""".strip()
+
 
 def _soap_post(body_xml: str, soap_action: str, timeout=30):
     headers = SOAP_HEADERS.copy()
     headers["SOAPAction"] = f"http://www.banguat.gob.gt/variables/ws/{soap_action}"
-    resp = requests.post(BANGUAT_SOAP_URL, data=body_xml.encode("utf-8"), headers=headers, timeout=timeout)
+    resp = SESSION.post(BANGUAT_SOAP_URL, data=body_xml.encode("utf-8"), headers=headers, timeout=timeout)
     resp.raise_for_status()
     return resp.content
 
@@ -141,30 +178,73 @@ def _parse_fecha_referencia(xml_bytes: bytes) -> pd.DataFrame:
     return df
 
 
+def _normalize_daily(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.drop_duplicates("date").set_index("date").sort_index()
+    full_idx = pd.date_range(df.index.min(), dt.date.today(), freq="D").date
+    s = df["tcr"].reindex(full_idx).ffill()
+    return pd.DataFrame({"date": full_idx, "tcr": s.values})
+
+
 @st.cache_data(ttl=60*60*12)  # 12 horas
 def fetch_banguat_series(start_date: dt.date = dt.date(1998, 1, 1)) -> pd.DataFrame:
     """
-    Descarga serie histórica desde 'start_date' hasta hoy, usando SOAP TipoCambioFechaInicial.
+    1) Intenta WS en modo 'todo de una vez' (TipoCambioFechaInicial).
+    2) Si falla (500/504), usa 'chunking' por tramos (TipoCambioRango).
+    3) Si aún falla, usa CSV local en data/banguat_tcr_gtq_usd.csv (si existe).
     """
-    fecha_ini = start_date.strftime("%d/%m/%Y")
-    body = _soap_envelope_fecha_inicial(fecha_ini)
+    # 1) intento rápido
     try:
+        body = _soap_envelope_fecha_inicial(start_date.strftime("%d/%m/%Y"))
         xml_bytes = _soap_post(body, "TipoCambioFechaInicial", timeout=40)
         df = _parse_fecha_referencia(xml_bytes)
+        if not df.empty:
+            return _normalize_daily(df)
     except Exception as e:
-        st.warning(f"Fallo al consultar WebService SOAP: {e}")
-        df = pd.DataFrame(columns=["date", "tcr"])
+        st.warning(f"WS (bloque completo) falló: {e}")
 
-    # Normalizamos a frecuencia diaria (vigente incluidos fines de semana, ffill)
-    if df.empty:
-        return df
+    # 2) modo robusto por tramos (120 días)
+    try:
+        df_parts = []
+        fini = start_date
+        ffin = dt.date.today()
+        chunk = dt.timedelta(days=120)
+        while fini <= ffin:
+            end = min(fini + chunk, ffin)
+            fini_s = fini.strftime("%d/%m/%Y"); end_s = end.strftime("%d/%m/%Y")
+            got = None
+            for variant in (0,1,2):
+                try:
+                    body = _soap_envelope_rango(fini_s, end_s, variant=variant)
+                    xml_bytes = _soap_post(body, "TipoCambioRango", timeout=40)
+                    tmp = _parse_fecha_referencia(xml_bytes)
+                    if not tmp.empty:
+                        got = tmp; break
+                except Exception:
+                    continue
+            if got is not None:
+                df_parts.append(got)
+            else:
+                st.info(f"No se obtuvo datos para tramo {fini_s}–{end_s} (se omite).")
+            fini = end + dt.timedelta(days=1)
 
-    df = df.drop_duplicates("date").set_index("date").sort_index()
-    full_idx = pd.date_range(df.index.min(), dt.date.today(), freq="D").date
-    s = df["tcr"].reindex(full_idx)
-    s = s.ffill()  # el TCR rige y se mantiene hasta el siguiente hábil
-    df2 = pd.DataFrame({"date": full_idx, "tcr": s.values})
-    return df2
+        if df_parts:
+            df = pd.concat(df_parts, ignore_index=True)
+            df = df.drop_duplicates("date").sort_values("date").reset_index(drop=True)
+            return _normalize_daily(df)
+    except Exception as e:
+        st.warning(f"WS (por tramos) falló: {e}")
+
+    # 3) Fallback offline: CSV en el repo
+    offline_path = os.path.join("data", "banguat_tcr_gtq_usd.csv")
+    if os.path.exists(offline_path):
+        st.info("Usando fallback offline: data/banguat_tcr_gtq_usd.csv")
+        df = pd.read_csv(offline_path)
+        df["date"] = pd.to_datetime(df["date"]).dt.date
+        df = df[["date","tcr"]].dropna().sort_values("date").reset_index(drop_number=True)
+        return _normalize_daily(df)
+
+    # 4) Nada funcionó
+    return pd.DataFrame(columns=["date","tcr"])
 
 
 def scrape_vigente_from_web() -> float | None:
@@ -174,10 +254,10 @@ def scrape_vigente_from_web() -> float | None:
     """
     try:
         url = "https://www.banguat.gob.gt/tipo_cambio/"
-        html = requests.get(url, timeout=20).text
+        html = SESSION.get(url, timeout=20).text
         soup = BeautifulSoup(html, "html.parser")
         text = soup.get_text(" ", strip=True)
-        m = re.search(r"\\b(\\d+\\.\\d{3,6})\\b", text)
+        m = re.search(r"\b(\d+\.\d{3,6})\b", text)
         if m:
             return float(m.group(1))
     except Exception:
@@ -251,7 +331,7 @@ with st.spinner("Descargando serie oficial del WebService de Banguat (1998→hoy
     hist = fetch_banguat_series(dt.date(1998, 1, 1))
 
 if hist.empty:
-    st.error("No fue posible obtener la serie histórica desde el WS de Banguat. Intenta más tarde o verifica tu red.")
+    st.error("No fue posible obtener la serie histórica desde el WS de Banguat ni desde el fallback. Sube data/banguat_tcr_gtq_usd.csv o intenta más tarde.")
     st.stop()
 
 # Validación cruzada rápida con scraping del vigente
@@ -318,7 +398,7 @@ else:
         else:
             yhat, lo, hi = random_walk_forecast(tcr_today)
             model_used = "Random Walk"
-    except Exception as e:
+    except Exception:
         try:
             if USE_ARIMA:
                 arima = fit_arima_model(hist)
@@ -386,11 +466,10 @@ st.download_button(
 with st.expander("Notas importantes / Metodología"):
     st.markdown(
         """
-- **Fuente primaria:** WebService SOAP del Banco de Guatemala. Se consume el método `TipoCambioFechaInicial` desde 01/01/1998 hasta hoy y se normaliza a frecuencia diaria con *forward-fill* (el TCR rige hasta la próxima actualización).
-- **Scraping de apoyo:** Se consulta la página pública del TCR vigente para verificación rápida; si difiere ±0.01 puede deberse a redondeos o tiempos de publicación.
-- **Pronóstico:** Por defecto **Prophet** (modelo aditivo con cambios de tendencia y estacionalidad anual). Alternativas: **ARIMA** y **Random Walk** (baseline).
-- **Intervalos:** IC 80% para una comunicación conservadora.
-- **Limitación:** El TCR tiende a comportarse como *random walk*; pronósticos a largo plazo convergen al último valor (amplios intervalos).
-- **Uso académico:** Este robot sirve para explorar escenarios; para usos normativos/tributarios consulte siempre el TCR oficial publicado por Banguat.
+- **Fuente primaria:** WebService SOAP del Banco de Guatemala. Si el WS devuelve 500, la app reintenta por **tramos** usando `TipoCambioRango`.
+- **Fallback:** si el WS no responde, carga `data/banguat_tcr_gtq_usd.csv` si existe.
+- **Pronóstico:** Prophet/ARIMA/Random Walk; IC 80%.
+- **Limitación:** El TCR tiende a comportarse como *random walk*; los intervalos crecen con el horizonte.
+- **Uso académico:** Verifique siempre el TCR oficial publicado por Banguat.
         """
     )
