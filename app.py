@@ -203,6 +203,55 @@ else:
         yhat = y.iloc[-1]; lo, hi = yhat-0.05, yhat+0.05; model_used = "Random Walk"
 
     st.info(f"**Pronóstico para {sel_date}** (modelo **{model_used}**): **Q {yhat:.5f}**  _IC 80%: {lo:.5f} ⟷ {hi:.5f}_")
+# === FIGURA 2: cola (24 meses) + pronóstico con banda ===
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+win_months = 24
+h = hist.copy()
+h["date"] = pd.to_datetime(h["date"])
+cut = pd.Timestamp(last_date) - pd.DateOffset(months=win_months)
+h = h[h["date"] >= cut]
+
+# Trayectoria futura según el modelo elegido arriba
+steps = max(1, (sel_date - last_date).days)  # por si el horizonte es 0
+if model_used.startswith("ARIMA") and 'model' in locals():
+    pred = model.get_forecast(steps=steps)
+    f_dates = pd.date_range(last_date + pd.Timedelta(days=1), sel_date, freq="D")
+    f_mean = pred.predicted_mean.to_numpy()
+    ci = pred.conf_int(alpha=0.2).to_numpy()  # 80%
+    f_lo, f_hi = ci[:, 0], ci[:, 1]
+
+elif model_used.startswith("Prophet") and 'fcst' in locals():
+    f = fcst[fcst["ds"] > pd.Timestamp(last_date)]
+    f_dates = pd.to_datetime(f["ds"])
+    f_mean = f["yhat"].to_numpy()
+    f_lo = f["yhat_lower"].to_numpy()
+    f_hi = f["yhat_upper"].to_numpy()
+
+else:
+    # Random Walk: línea horizontal (último valor) y banda constante
+    f_dates = pd.date_range(last_date + pd.Timedelta(days=1), sel_date, freq="D")
+    last_val = float(h["tcr"].iloc[-1])
+    f_mean = np.full(len(f_dates), last_val)
+    f_lo = np.full(len(f_dates), float(lo))
+    f_hi = np.full(len(f_dates), float(hi))
+
+fig2, ax2 = plt.subplots(figsize=(8,3))
+ax2.plot(h["date"], h["tcr"], label="Histórico", linewidth=1.4)
+ax2.plot(f_dates, f_mean, label="Pronóstico", linewidth=1.6)
+ax2.fill_between(f_dates, f_lo, f_hi, alpha=0.20, label="IC 80%")
+ax2.axvline(pd.Timestamp(last_date), linestyle="--", linewidth=1, alpha=0.6)
+ax2.scatter([pd.Timestamp(sel_date)],
+            [f_mean[-1] if len(f_mean) else float(yhat)],
+            s=30, zorder=3, label=f"{sel_date}")
+ax2.set_xlabel("Fecha"); ax2.set_ylabel("Q por USD")
+ax2.grid(True, alpha=0.25); ax2.legend(loc="best")
+
+# Muestra en la app y guarda PNG para el paper
+st.pyplot(fig2, clear_figure=True)
+fig2.savefig("fig_pronostico.png", dpi=300, bbox_inches="tight")
 
 # ---------- Gráfico ----------
 import matplotlib.pyplot as plt
