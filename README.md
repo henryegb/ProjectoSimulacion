@@ -24,9 +24,7 @@ Abre el navegador en la URL que te muestre (normalmente `http://localhost:8501`)
 Si la instalación de `prophet`/`pystan` se complica, ejecuta con `requirements-lite.txt` y en la interfaz selecciona **ARIMA** o **Random Walk** para los pronósticos.
 
 ## Deploy en Streamlit Community Cloud
-1. Sube estos archivos a un repo en GitHub.
-2. Ve a https://streamlit.io → **Community Cloud** → **New app**.
-3. Elige tu repo/branch y `app.py`. ¡Listo! Comparte el **link público**.
+1. Disponible en streamlit para ejecutar en cualquier momento
 
 ## Docker (opcional)
 ```bash
