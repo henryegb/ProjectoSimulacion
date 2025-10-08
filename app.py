@@ -17,6 +17,7 @@ import streamlit as st
 from bs4 import BeautifulSoup
 from lxml import etree
 from dateutil.relativedelta import relativedelta
+import matplotlib.pyplot as plt  # <- para las figuras
 
 # ----- Modelos -----
 USE_PROPHET = True
@@ -32,7 +33,7 @@ except Exception:
     USE_ARIMA = False
 
 st.set_page_config(page_title="Robot TCR GTQ/USD — Offline-first", page_icon="💱", layout="wide")
-st.title("💱 Robot del Tipo de Cambio (GTQ/USD) — Banguat + Pronóstico (offline‑first)")
+st.title("💱 Robot del Tipo de Cambio (GTQ/USD) — Banguat + Pronóstico (offline-first)")
 st.caption("Usa el CSV del repositorio como fuente principal. WS solo como respaldo.")
 
 # ---------- UI (sidebar) ----------
@@ -177,19 +178,24 @@ st.markdown("### Resultado")
 if not is_future:
     val = hist.set_index("date").loc[sel_date, "tcr"]
     st.success(f"**TCR oficial para {sel_date}: Q {val:.5f}**")
+
 else:
-    # modelos simples
+    # --- PRONÓSTICO ---
     y = hist["tcr"].astype("float64")
     horizon = (sel_date - last_date).days
     try:
         if model_choice.startswith("ARIMA") and USE_ARIMA:
-            model = sm.tsa.SARIMAX(y, order=(1,1,0), enforce_stationarity=False, enforce_invertibility=False).fit(disp=False)
+            model = sm.tsa.SARIMAX(y, order=(1,1,0),
+                                   enforce_stationarity=False,
+                                   enforce_invertibility=False).fit(disp=False)
             pred = model.get_forecast(steps=horizon)
             yhat = float(pred.predicted_mean.iloc[-1])
             lo, hi = pred.conf_int(alpha=0.2).iloc[-1]
             model_used = "ARIMA(1,1,0)"
         elif model_choice.startswith("Prophet") and USE_PROPHET:
-            m = Prophet(growth="flat", daily_seasonality=True, weekly_seasonality=False, yearly_seasonality=True, interval_width=0.8)
+            m = Prophet(growth="flat", daily_seasonality=True,
+                        weekly_seasonality=False, yearly_seasonality=True,
+                        interval_width=0.8)
             m.fit(hist.rename(columns={"date":"ds","tcr":"y"}))
             future = m.make_future_dataframe(periods=horizon, freq="D", include_history=True)
             fcst = m.predict(future)
@@ -202,64 +208,60 @@ else:
     except Exception:
         yhat = y.iloc[-1]; lo, hi = yhat-0.05, yhat+0.05; model_used = "Random Walk"
 
-    st.info(f"**Pronóstico para {sel_date}** (modelo **{model_used}**): **Q {yhat:.5f}**  _IC 80%: {lo:.5f} ⟷ {hi:.5f}_")
-# === FIGURA 2: cola (24 meses) + pronóstico con banda ===
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
+    st.info(f"**Pronóstico para {sel_date}** (modelo **{model_used}**): "
+            f"**Q {yhat:.5f}**  _IC 80%: {lo:.5f} ⟷ {hi:.5f}_")
 
-win_months = 24
-h = hist.copy()
-h["date"] = pd.to_datetime(h["date"])
-cut = pd.Timestamp(last_date) - pd.DateOffset(months=win_months)
-h = h[h["date"] >= cut]
+    # === FIGURA 2: cola (24 meses) + pronóstico con banda ===
+    win_months = 24
+    h = hist.copy()
+    h["date"] = pd.to_datetime(h["date"])
+    cut = pd.Timestamp(last_date) - pd.DateOffset(months=win_months)
+    h = h[h["date"] >= cut]
 
-# Trayectoria futura según el modelo elegido arriba
-steps = max(1, (sel_date - last_date).days)  # por si el horizonte es 0
-if model_used.startswith("ARIMA") and 'model' in locals():
-    pred = model.get_forecast(steps=steps)
-    f_dates = pd.date_range(last_date + pd.Timedelta(days=1), sel_date, freq="D")
-    f_mean = pred.predicted_mean.to_numpy()
-    ci = pred.conf_int(alpha=0.2).to_numpy()  # 80%
-    f_lo, f_hi = ci[:, 0], ci[:, 1]
+    steps = max(1, (sel_date - last_date).days)
+    if model_used.startswith("ARIMA") and 'model' in locals():
+        pred = model.get_forecast(steps=steps)
+        f_dates = pd.date_range(last_date + pd.Timedelta(days=1), sel_date, freq="D")
+        f_mean = pred.predicted_mean.to_numpy()
+        ci = pred.conf_int(alpha=0.2).to_numpy()  # 80%
+        f_lo, f_hi = ci[:, 0], ci[:, 1]
 
-elif model_used.startswith("Prophet") and 'fcst' in locals():
-    f = fcst[fcst["ds"] > pd.Timestamp(last_date)]
-    f_dates = pd.to_datetime(f["ds"])
-    f_mean = f["yhat"].to_numpy()
-    f_lo = f["yhat_lower"].to_numpy()
-    f_hi = f["yhat_upper"].to_numpy()
+    elif model_used.startswith("Prophet") and 'fcst' in locals():
+        f = fcst[fcst["ds"] > pd.Timestamp(last_date)]
+        f_dates = pd.to_datetime(f["ds"])
+        f_mean = f["yhat"].to_numpy()
+        f_lo = f["yhat_lower"].to_numpy()
+        f_hi = f["yhat_upper"].to_numpy()
 
-else:
-    # Random Walk: línea horizontal (último valor) y banda constante
-    f_dates = pd.date_range(last_date + pd.Timedelta(days=1), sel_date, freq="D")
-    last_val = float(h["tcr"].iloc[-1])
-    f_mean = np.full(len(f_dates), last_val)
-    f_lo = np.full(len(f_dates), float(lo))
-    f_hi = np.full(len(f_dates), float(hi))
+    else:
+        # Random Walk: línea horizontal (último valor) y banda constante
+        f_dates = pd.date_range(last_date + pd.Timedelta(days=1), sel_date, freq="D")
+        last_val = float(h["tcr"].iloc[-1])
+        f_mean = np.full(len(f_dates), last_val)
+        f_lo   = np.full(len(f_dates), float(lo))
+        f_hi   = np.full(len(f_dates), float(hi))
 
-fig2, ax2 = plt.subplots(figsize=(8,3))
-ax2.plot(h["date"], h["tcr"], label="Histórico", linewidth=1.4)
-ax2.plot(f_dates, f_mean, label="Pronóstico", linewidth=1.6)
-ax2.fill_between(f_dates, f_lo, f_hi, alpha=0.20, label="IC 80%")
-ax2.axvline(pd.Timestamp(last_date), linestyle="--", linewidth=1, alpha=0.6)
-ax2.scatter([pd.Timestamp(sel_date)],
-            [f_mean[-1] if len(f_mean) else float(yhat)],
-            s=30, zorder=3, label=f"{sel_date}")
-ax2.set_xlabel("Fecha"); ax2.set_ylabel("Q por USD")
-ax2.grid(True, alpha=0.25); ax2.legend(loc="best")
+    fig2, ax2 = plt.subplots(figsize=(8,3))
+    ax2.plot(h["date"], h["tcr"], label="Histórico", linewidth=1.4)
+    ax2.plot(f_dates, f_mean, label="Pronóstico", linewidth=1.6)
+    ax2.fill_between(f_dates, f_lo, f_hi, alpha=0.20, label="IC 80%")
+    ax2.axvline(pd.Timestamp(last_date), linestyle="--", linewidth=1, alpha=0.6)
+    ax2.scatter([pd.Timestamp(sel_date)],
+                [f_mean[-1] if len(f_mean) else float(yhat)],
+                s=30, zorder=3, label=f"{sel_date}")
+    ax2.set_xlabel("Fecha"); ax2.set_ylabel("Q por USD")
+    ax2.grid(True, alpha=0.25); ax2.legend(loc="best")
 
-# Muestra en la app y guarda PNG para el paper
-st.pyplot(fig2, clear_figure=True)
-fig2.savefig("fig_pronostico.png", dpi=300, bbox_inches="tight")
+    st.pyplot(fig2, clear_figure=True)
+    fig2.savefig("fig_pronostico.png", dpi=300, bbox_inches="tight")
 
-# ---------- Gráfico ----------
-import matplotlib.pyplot as plt
+# ---------- Figura 1: histórico completo ----------
 fig, ax = plt.subplots(figsize=(10,4))
 ax.plot(pd.to_datetime(hist["date"]), hist["tcr"], linewidth=1.5, label="Histórico")
 ax.set_xlabel("Fecha"); ax.set_ylabel("Q por USD"); ax.grid(True, alpha=0.25)
 ax.legend(loc="best")
 st.pyplot(fig, clear_figure=True)
+fig.savefig("fig_hist.png", dpi=300, bbox_inches="tight")
 
 # ---------- Descarga ----------
 st.download_button("⬇️ Descargar CSV (histórico en uso)", data=hist.to_csv(index=False).encode("utf-8"),
@@ -267,3 +269,4 @@ st.download_button("⬇️ Descargar CSV (histórico en uso)", data=hist.to_csv(
 
 with st.expander("Notas"):
     st.markdown("- Este modo usa **CSV versionado**. Para mantenerlo actualizado, configura el **workflow de GitHub Actions** incluido en el repo.")
+
