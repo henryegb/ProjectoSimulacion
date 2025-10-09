@@ -269,4 +269,247 @@ st.download_button("⬇️ Descargar CSV (histórico en uso)", data=hist.to_csv(
 
 with st.expander("Notas"):
     st.markdown("- Este modo usa **CSV versionado**. Para mantenerlo actualizado, configura el **workflow de GitHub Actions** incluido en el repo.")
+    
+# =========================================================
+# === BLOQUE NUEVO: DESARROLLO 95% (tramos + back-testing)
+# =========================================================
+import numpy as np
+import pandas as pd
+import streamlit as st
+from statsmodels.stats.stattools import jarque_bera
+
+st.markdown("---")
+st.header("Desarrollo 95% (tramos + back-testing)")
+
+# ---------- Helpers de modelado ----------
+def fit_poly(x, y, deg):
+    X = np.vstack([x**k for k in range(deg+1)]).T
+    beta = np.linalg.lstsq(X, y, rcond=None)[0]
+    yhat = X @ beta
+    ss_res = float(np.sum((y - yhat)**2))
+    ss_tot = float(np.sum((y - y.mean())**2))
+    r2 = 1 - ss_res/ss_tot if ss_tot>0 else 0.0
+    return yhat, r2, {"beta": beta}
+
+def fit_loglin(x, y):
+    # y > 0 para usar log
+    y_safe = np.where(y <= 0, np.nan, y)
+    mask = ~np.isnan(y_safe)
+    if mask.sum() < 3:
+        return np.full_like(y, y.mean(), dtype=float), 0.0, {"ok": False}
+    Y = np.log(y_safe[mask])
+    X = np.vstack([np.ones(mask.sum()), x[mask]]).T
+    beta = np.linalg.lstsq(X, Y, rcond=None)[0]
+    yhat = np.exp(beta[0] + beta[1]*x)
+    ss_res = float(np.nansum((y - yhat)**2))
+    ss_tot = float(np.nansum((y - np.nanmean(y))**2))
+    r2 = 1 - ss_res/ss_tot if ss_tot>0 else 0.0
+    return yhat, r2, {"beta": beta, "ok": True}
+
+def moving_average(y, win=30):
+    return pd.Series(y).rolling(win, min_periods=1).mean().values
+
+def fit_ses(y):
+    # SES sin dependencias extra (wrapper simple de Holt-Winters si la tuvieras),
+    # aquí usamos la media móvil como baseline SES si no hay stats especial.
+    # Si prefieres, deja este SES simple; suele bastar para TCR cuasi plano.
+    # Ajuste "alpha" por búsqueda en malla para minimizar RMSE in-sample.
+    best = (np.inf, 0.2, None)  # (rmse, alpha, yhat)
+    for alpha in np.linspace(0.05, 0.95, 19):
+        yhat = np.zeros_like(y, dtype=float)
+        yhat[0] = y[0]
+        for t in range(1, len(y)):
+            yhat[t] = alpha*y[t-1] + (1-alpha)*yhat[t-1]
+        rmse = float(np.sqrt(np.mean((y - yhat)**2)))
+        if rmse < best[0]:
+            best = (rmse, alpha, yhat.copy())
+    yhat = best[2]
+    ss_res = float(np.sum((y - yhat)**2))
+    ss_tot = float(np.sum((y - y.mean())**2))
+    r2 = 1 - ss_res/ss_tot if ss_tot>0 else 0.0
+    return yhat, r2, {"alpha": best[1]}
+
+def pearson_r(y, yhat):
+    y1 = y - y.mean(); y2 = yhat - yhat.mean()
+    denom = float(np.sqrt((y1**2).sum() * (y2**2).sum()))
+    return float((y1*y2).sum()/denom) if denom>0 else 0.0
+
+def metrics_test(y_true, y_pred):
+    err = y_true - y_pred
+    mae = float(np.mean(np.abs(err)))
+    rmse = float(np.sqrt(np.mean(err**2)))
+    mape = float(np.mean(np.abs(err / y_true)) * 100)
+    rmse_pct = float(rmse / max(1e-9, np.mean(y_true)) * 100)
+    jb_stat, jb_p, _, _ = jarque_bera(err)
+    return mae, rmse, mape, rmse_pct, float(jb_p)
+
+def choose_model(x_tr, y_tr, allow):
+    cands = []
+    # Poly1/2/3
+    if allow["poly1"]:
+        y1, r2_1, p1 = fit_poly(x_tr, y_tr, 1); cands.append(("Poly1", y1, r2_1, p1))
+    if allow["poly2"]:
+        y2, r2_2, p2 = fit_poly(x_tr, y_tr, 2); cands.append(("Poly2", y2, r2_2, p2))
+    if allow["poly3"]:
+        y3, r2_3, p3 = fit_poly(x_tr, y_tr, 3); cands.append(("Poly3", y3, r2_3, p3))
+    # Log-lineal
+    if allow["log"]:
+        yl, r2_l, pl = fit_loglin(x_tr, y_tr); cands.append(("Log-lin", yl, r2_l, pl))
+    # SES
+    if allow["ses"]:
+        yes, r2_es, pes = fit_ses(y_tr); cands.append(("SES", yes, r2_es, pes))
+    # MA
+    if allow["ma"]:
+        yma = moving_average(y_tr, allow["ma_win"])
+        ss_res = float(np.sum((y_tr - yma)**2)); ss_tot = float(np.sum((y_tr - y_tr.mean())**2))
+        r2_ma = 1 - ss_res/ss_tot if ss_tot>0 else 0.0
+        cands.append((f"MA({allow['ma_win']})", yma, r2_ma, {"k": allow["ma_win"]}))
+
+    # criterio de selección (r o R2, se define afuera)
+    return cands
+
+def predict_model(name, pars, x_te, x0, y_tr_last):
+    if name.startswith("Poly"):
+        deg = int(name[-1]); beta = pars["beta"]
+        Xte = np.vstack([x_te**k for k in range(deg+1)]).T
+        return Xte @ beta
+    if name == "Log-lin" and pars.get("ok", False):
+        b0, b1 = pars["beta"]; return np.exp(b0 + b1*x_te)
+    # SES / MA: extensión naive (mantener último nivel) para test
+    return np.full_like(x_te, y_tr_last, dtype="float64")
+
+def build_segments_from_cuts(df, cut_str, min_days=180):
+    cuts = []
+    if cut_str.strip():
+        for tok in cut_str.split(","):
+            try:
+                cuts.append(pd.to_datetime(tok.strip()).normalize())
+            except Exception:
+                pass
+    cuts = [c for c in sorted(cuts) if df["date"].min() < c < df["date"].max()]
+    segs, start = [], df["date"].min().normalize()
+    for c in cuts:
+        segs.append((start, c))
+        start = c + pd.Timedelta(days=1)
+    segs.append((start, df["date"].max().normalize()))
+    segs = [s for s in segs if (s[1]-s[0]).days + 1 >= min_days]
+    return segs
+
+def evaluate_segments(df, segments, allow, target="r", ma_win=30):
+    rows = []
+    w_sum = 0.0; r_num = 0.0; r2_num = 0.0
+    for (a,b) in segments:
+        d = df[(df["date"]>=a) & (df["date"]<=b)].copy().reset_index(drop=True)
+        n = len(d)
+        if n < 20:  # tramo muy corto, omitir
+            continue
+        n_tr = max(int(n*0.8), 1)
+        d_tr, d_te = d.iloc[:n_tr], d.iloc[n_tr:]
+        if len(d_te)==0:
+            continue
+        x0 = d_tr["date"].iloc[0]
+        x_tr = (d_tr["date"] - x0).dt.days.values.astype(float)
+        y_tr = d_tr["tcr"].astype("float64").values
+        x_te = (d_te["date"] - x0).dt.days.values.astype(float)
+        y_te = d_te["tcr"].astype("float64").values
+
+        all_cands = choose_model(x_tr, y_tr, allow)
+        # Métrica de selección
+        scored = []
+        for name, yhat_tr, r2_tr, pars in all_cands:
+            r_tr = pearson_r(y_tr, yhat_tr)
+            score = r_tr if target == "r" else r2_tr
+            scored.append((score, name, yhat_tr, r2_tr, r_tr, pars))
+        if not scored:
+            continue
+        scored.sort(key=lambda z: z[0], reverse=True)
+        _, model, yhat_tr, r2_tr, r_tr, pars = scored[0]
+
+        yhat_te = predict_model(model, pars, x_te, x0, y_tr[-1])
+        mae, rmse, mape, rmse_pct, jb_p = metrics_test(y_te, yhat_te)
+
+        rows.append(dict(
+            tramo=f"{a.date()}–{b.date()}",
+            n=int(n),
+            modelo=model,
+            R2_train=round(r2_tr*100,2),
+            r_train=round(r_tr*100,2),
+            MAE=round(mae,5),
+            RMSE=round(rmse,5),
+            MAPE=round(mape,3),
+            RMSEpct=round(rmse_pct,3),
+            JB_p=round(jb_p,4),
+        ))
+
+        w = n
+        w_sum += w
+        r2_num += (r2_tr*100)*w
+        r_num  += (r_tr*100)*w
+
+    tabla = pd.DataFrame(rows)
+    R2_prom = float(r2_num/w_sum) if w_sum>0 else float("nan")
+    r_prom  = float(r_num /w_sum) if w_sum>0 else float("nan")
+    return tabla, R2_prom, r_prom
+
+# ---------- UI ----------
+col = st.columns([2,1,1,1])
+with col[0]:
+    default_cuts = "2004-12-31, 2016-12-31, 2019-12-31"
+    cut_str = st.text_input("Fechas de corte (YYYY-MM-DD, separadas por coma)", value=default_cuts)
+with col[1]:
+    min_days = st.number_input("Mín. días por tramo", min_value=120, max_value=2000, value=180, step=30)
+with col[2]:
+    target_metric = st.selectbox("Meta de ajuste", ["r (correlación)", "R2 (determinación)"], index=0)
+with col[3]:
+    ma_win = st.number_input("Ventana MA (días)", min_value=7, max_value=90, value=30, step=1)
+
+c2 = st.columns(6)
+with c2[0]: allow_poly1 = st.checkbox("Poly1", True)
+with c2[1]: allow_poly2 = st.checkbox("Poly2", True)
+with c2[2]: allow_poly3 = st.checkbox("Poly3", False)
+with c2[3]: allow_log   = st.checkbox("Log-lin", True)
+with c2[4]: allow_ses   = st.checkbox("SES", True)
+with c2[5]: allow_ma    = st.checkbox("MA", True)
+
+if st.button("Calcular tramos y métricas", type="primary"):
+    df = hist.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").reset_index(drop=True)
+
+    allow = dict(poly1=allow_poly1, poly2=allow_poly2, poly3=allow_poly3,
+                 log=allow_log, ses=allow_ses, ma=allow_ma, ma_win=int(ma_win))
+    segments = build_segments_from_cuts(df, cut_str, min_days=min_days)
+
+    if not segments:
+        st.warning("No se construyeron tramos (revisa cortes y/o mínimo de días).")
+    else:
+        st.write("**Tramos:**", " | ".join([f"{a.date()}–{b.date()}" for a,b in segments]))
+        tabla, R2_prom, r_prom = evaluate_segments(df, segments, allow,
+                                                   target=("r" if target_metric.startswith("r") else "R2"),
+                                                   ma_win=int(ma_win))
+        if tabla.empty:
+            st.warning("No hubo suficiente data en los tramos para back-testing.")
+        else:
+            colm = st.columns(2)
+            with colm[0]:
+                st.metric("R² promedio ponderado (entrenamiento)", f"{R2_prom:.2f}%")
+            with colm[1]:
+                ok = (r_prom >= 95.0) if target_metric.startswith("r") else (R2_prom >= 95.0)
+                etiqueta = "≥95% ✅" if ok else "Por debajo de 95%"
+                st.metric(("r promedio ponderado (entrenamiento)" if target_metric.startswith("r") else "R² objetivo"),
+                          f"{(r_prom if target_metric.startswith('r') else R2_prom):.2f}%", delta=etiqueta)
+
+            st.info("Objetivo sugerido por consigna: **coeficiente de correlación (r) ≥ 95%** en promedio ponderado; además, **RMSE% ≤ 5** por tramo y residuos con **JB p>0.05** preferentemente.")
+            st.dataframe(tabla, use_container_width=True)
+
+            # Descargas
+            st.download_button("⬇️ CSV (tramos + métricas)", data=tabla.to_csv(index=False).encode("utf-8"),
+                               file_name="tramos_backtesting.csv", mime="text/csv")
+
+            # Bloque LaTeX
+            lines = []
+            for _,r in tabla.iterrows():
+                line = (f"{r['tramo']} & {r['n']} & {r['modelo']} & {r['R2_train']:.2f} & "
+                        f"{r['r_train']:.2f} & {r['MAE']:.5f} & {r['RMSE']:.5f} & "
+                        f"{r['MAPE']:.2f} & {r['RMSEpct']:.
 
